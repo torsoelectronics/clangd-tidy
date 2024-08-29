@@ -1,0 +1,6 @@
+- id: clangd-tidy
+  name: Run clangd-tidy
+  description: A faster version of clang-tidy using clangd
+  entry: clangd-tidy
+  language: python
+  types_or: [c++, c]
