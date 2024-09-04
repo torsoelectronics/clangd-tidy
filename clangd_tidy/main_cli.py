@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+from collections import defaultdict, namedtuple
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -209,6 +211,11 @@ def main_cli():
         "-v", "--verbose", action="store_true", help="Show verbose output from clangd."
     )
     parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Apply fixes suggested by clangd.",
+    )
+    parser.add_argument(
         "filename",
         nargs="+",
         help="Files to check. Files whose extensions are not in ALLOW_EXTENSIONS will be ignored.",
@@ -217,16 +224,103 @@ def main_cli():
 
     ext_filter = FileExtensionFilter(set(map(str.strip, args.allow_extensions)))
     files = list(filter(ext_filter, args.filename))
+    run(
+        files=files,
+        compile_commands_dir=args.compile_commands_dir,
+        clangd_executable=args.clangd_executable,
+        jobs=args.jobs,
+        output=args.output,
+        fail_on_severity=args.fail_on_severity,
+        tqdm=args.tqdm,
+        github=args.github,
+        git_root=args.git_root,
+        compact=args.compact,
+        context=args.context,
+        color=args.color,
+        verbose=args.verbose,
+        fix=args.fix,
+    )
+
+
+def run(
+    files,
+    compile_commands_dir,
+    clangd_executable,
+    jobs,
+    output,
+    fail_on_severity,
+    tqdm,
+    github,
+    git_root,
+    compact,
+    context,
+    color,
+    verbose,
+    fix,
+):
     for file in files:
         if not os.path.isfile(file):
             print(f"File not found: {file}", file=sys.stderr)
             sys.exit(1)
 
+    files_to_process = files
+
+    while files_to_process:
+        collector = collect_diagnostics(
+            files_to_process,
+            compile_commands_dir,
+            clangd_executable,
+            jobs,
+            verbose,
+            tqdm,
+        )
+
+        if fix:
+            files_to_process, collector.diagnostics = apply_fixes(collector.diagnostics)
+            if files_to_process:
+                print(
+                    f"Reprocessing {len(files_to_process)} files due to overlapping changes",
+                    file=sys.stderr,
+                )
+        else:
+            files_to_process = []
+
+    formatter = (
+        FancyDiagnosticFormatter(
+            extra_context=context,
+            enable_color=(
+                _is_output_supports_color(output)
+                if color == "auto"
+                else color == "always"
+            ),
+        )
+        if not compact
+        else CompactDiagnosticFormatter()
+    )
+    print(collector.format_diagnostics(formatter), file=output)
+    if github:
+        print(
+            collector.format_diagnostics(
+                GithubActionWorkflowCommandDiagnosticFormatter(
+                    git_root
+                )
+            ),
+            file=output,
+        )
+    if collector.check_failed(fail_on_severity):
+        exit(1)
+
+
+def collect_diagnostics(
+    files, compile_commands_dir, clangd_executable, jobs, verbose, tqdm
+):
     clangd_command = [
-        f"{args.clangd_executable}",
-        f"--compile-commands-dir={args.compile_commands_dir}",
+        f"{clangd_executable}",
+        f"--compile-commands-dir={compile_commands_dir}",
         "--clang-tidy",
-        f"-j={args.jobs}",
+        f"-j={jobs}",
+        "--background-index",
+        "--background-index-priority=normal",
         "--pch-storage=memory",
         "--enable-config",
         "--offset-encoding=utf-16",
@@ -239,7 +333,7 @@ def main_cli():
         stderr=subprocess.PIPE,
     )
     assert p.stderr is not None
-    read_pipe = ReadPipe(p.stderr, args.verbose and sys.stderr or open(os.devnull, "w"))
+    read_pipe = ReadPipe(p.stderr, verbose and sys.stderr or open(os.devnull, "w"))
     read_pipe.start()
 
     # Kill clangd subprocess on SIGINT
@@ -263,13 +357,27 @@ def main_cli():
     root_uri = _file_uri(root_path)
     workspace_folders = [{"name": "foo", "uri": root_uri}]
 
-    lsp_client.initialize(p.pid, None, root_uri, None, None, "off", workspace_folders)
+    lsp_client.initialize(
+        processId=p.pid,
+        rootPath=None,
+        rootUri=root_uri,
+        initializationOptions=None,
+        capabilities={
+            "textDocument": {
+                "publishDiagnostics": {
+                    "codeActionsInline": True,  # only supported by clangd
+                },
+            }
+        },
+        trace="off",
+        workspaceFolders=workspace_folders,
+    )
     lsp_client.initialized()
 
     for file in files:
         collector.request_diagnostics(lsp_client, file)
 
-    if args.tqdm:
+    if tqdm:
         try:
             from tqdm import tqdm
         except ImportError:
@@ -277,9 +385,9 @@ def main_cli():
                 "tqdm not found. Please install tqdm to enable progress bar.",
                 file=sys.stderr,
             )
-            args.tqdm = False
+            tqdm = False
 
-    if args.tqdm:
+    if tqdm:
         from tqdm import tqdm
 
         with tqdm(total=len(files)) as pbar:
@@ -302,25 +410,152 @@ def main_cli():
     if read_pipe.is_alive():
         read_pipe.join()
 
-    formatter = (
-        FancyDiagnosticFormatter(
-            extra_context=args.context,
-            enable_color=(
-                _is_output_supports_color(args.output)
-                if args.color == "auto"
-                else args.color == "always"
-            ),
-        )
-        if not args.compact
-        else CompactDiagnosticFormatter()
+    return collector
+
+
+Position = namedtuple("Position", ["line", "character"])
+Range = namedtuple("Range", ["start", "end"])
+Change = namedtuple("Change", ["range", "new_text"])
+ChangeSet = namedtuple("ChangeSet", ["action", "changes"])
+
+
+def range_from_dict(d):
+    return Range(
+        Position(d["start"]["line"], d["start"]["character"]),
+        Position(d["end"]["line"], d["end"]["character"]),
     )
-    print(collector.format_diagnostics(formatter), file=args.output)
-    if args.github:
-        print(
-            collector.format_diagnostics(
-                GithubActionWorkflowCommandDiagnosticFormatter(args.git_root)
-            ),
-            file=args.output,
+
+
+def apply_fixes(file_diagnostics):
+    remaining_diagnostics = {}
+    all_change_sets = defaultdict(list)
+    for file, diagnostics in file_diagnostics.items():
+        unfixed_diagnostics = []
+        for diagnostic in diagnostics:
+            for action in diagnostic.get("codeActions", []):
+                assert action["kind"] == "quickfix", action
+                assert "edit" in action, action
+                assert list(action["edit"].keys()) == ["changes"], action
+                assert len(action["edit"]["changes"]) > 0, action
+                title = action["title"]
+                if title == "remove all unused includes":
+                    # Use the other actions to remove the includes
+                    continue
+                for document, edits in action["edit"]["changes"].items():
+                    edit_file = document.removeprefix("file://")
+                    assert (
+                        edit_file in file_diagnostics
+                    ), f"Got a change for a file that was not requested: {edit_file}"
+                    changes = [
+                        Change(
+                            range=range_from_dict(edit["range"]),
+                            new_text=edit["newText"],
+                        )
+                        for edit in edits
+                    ]
+                    # Sort changes by end position in descending order so that we don't change the position of
+                    # subsequent changes when applying them
+                    changes.sort(key=lambda change: change.range.end, reverse=True)
+                    for change1, change2 in zip(changes, changes[1:]):
+                        # Ensure that there is no overlap between changes within the same action
+                        assert change1.range.end >= change2.range.start, (
+                            change1,
+                            change2,
+                        )
+                    all_change_sets[edit_file].append(
+                        ChangeSet(action=f'"{title}"', changes=changes)
+                    )
+                # Ensure we only apply one action per diagnostic
+                break
+            else:
+                unfixed_diagnostics.append(diagnostic)
+        if unfixed_diagnostics:
+            remaining_diagnostics[file] = unfixed_diagnostics
+
+    files_to_reprocess = set()
+
+    for file, change_sets in all_change_sets.items():
+        # Sort change sets by the end position of the last change in descending order so that we don't change the
+        # position of subsequent non-overlapping change sets when applying them
+        change_sets.sort(
+            key=lambda change_set: change_set.changes[-1].range.end, reverse=True
         )
-    if collector.check_failed(args.fail_on_severity):
-        exit(1)
+        merged_change_sets = []
+        for change_set in change_sets:
+            if not merged_change_sets:
+                merged_change_sets.append(change_set)
+                continue
+            for change in change_set.changes:
+                for merged_change in merged_change_sets[-1].changes:
+                    if (
+                        change.range.end > merged_change.range.start
+                        and change.range.start < merged_change.range.end
+                    ):
+                        # Overlapping changes, can't merge
+                        merged_change_sets.append(change_set)
+                        break
+                else:
+                    # No overlap for this change
+                    continue
+                break
+            else:
+                # No overlap for any change in the set
+                merged_change_set = ChangeSet(
+                    action=merged_change_sets[-1].action + " + " + change_set.action,
+                    changes=merged_change_sets[-1].changes + change_set.changes,
+                )
+                merged_change_set.changes.sort(
+                    key=lambda change: change.range.end, reverse=True
+                )
+                merged_change_sets[-1] = merged_change_set
+                continue
+
+        with open(file, "r") as f:
+            # Read the file as UTF-16 because clangd outputs diagnostics with UTF-16 offsets (le is for little-endian
+            # and doesn't matter but without it Python will add a byte order mark to the beginning of the string)
+            content = f.read().encode("utf-16-le")
+
+        print(f"Applying changes for {file}:", file=sys.stderr)
+        line_indices = [0] + [
+            m.end() for m in re.finditer("\n".encode("utf-16-le"), content)
+        ]
+        pos_to_index = (
+            lambda pos: line_indices[pos.line] + pos.character * 2
+        )  # 2 bytes per character
+        last_start = None
+        for change_set in merged_change_sets:
+            # Skip change sets that overlap with the previous one
+            if last_start is not None and change_set.changes[0].range.end > last_start:
+                print(
+                    f"  Skipping {change_set.action} because it overlaps with the previous change set",
+                    file=sys.stderr,
+                )
+                files_to_reprocess.add(file)
+                continue
+            last_start = change_set.changes[-1].range.start
+            print(f"  {change_set.action}:", file=sys.stderr)
+            for change in change_set.changes:
+                start = change.range.start
+                end = change.range.end
+                old_text = content[pos_to_index(start) : pos_to_index(end)].decode(
+                    "utf-16-le"
+                )
+                print(
+                    f"    {start.line + 1}:{start.character + 1}-{end.line + 1}:{end.character + 1}: "
+                    f"'{old_text}' -> '{change.new_text}'",
+                    file=sys.stderr,
+                )
+                content = (
+                    content[: pos_to_index(start)]
+                    + change.new_text.encode("utf-16-le")
+                    + content[pos_to_index(end) :]
+                )
+        print("  Done", file=sys.stderr)
+        with open(file, "w") as f:
+            f.write(content.decode("utf-16-le"))
+
+    return list(sorted(files_to_reprocess)), remaining_diagnostics
+
+
+if __name__ == "__main__":
+    main()
