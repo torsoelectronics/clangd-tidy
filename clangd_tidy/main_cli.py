@@ -429,6 +429,7 @@ def range_from_dict(d):
 def apply_fixes(file_diagnostics):
     remaining_diagnostics = {}
     all_change_sets = defaultdict(list)
+    applied_changes = defaultdict(set)
     for file, diagnostics in file_diagnostics.items():
         unfixed_diagnostics = []
         for diagnostic in diagnostics:
@@ -462,6 +463,12 @@ def apply_fixes(file_diagnostics):
                             change1,
                             change2,
                         )
+                    # Check that we don't apply the same action multiple times (e.g. if adding the same header is
+                    # suggested for multiple diagnostics)
+                    key = tuple(changes)
+                    if key in applied_changes[edit_file]:
+                        continue
+                    applied_changes[edit_file].add(key)
                     all_change_sets[edit_file].append(
                         ChangeSet(action=f'"{title}"', changes=changes)
                     )
@@ -488,8 +495,8 @@ def apply_fixes(file_diagnostics):
             for change in change_set.changes:
                 for merged_change in merged_change_sets[-1].changes:
                     if (
-                        change.range.end > merged_change.range.start
-                        and change.range.start < merged_change.range.end
+                        change.range.end >= merged_change.range.start
+                        and change.range.start <= merged_change.range.end
                     ):
                         # Overlapping changes, can't merge
                         merged_change_sets.append(change_set)
@@ -525,7 +532,7 @@ def apply_fixes(file_diagnostics):
         last_start = None
         for change_set in merged_change_sets:
             # Skip change sets that overlap with the previous one
-            if last_start is not None and change_set.changes[0].range.end > last_start:
+            if last_start is not None and change_set.changes[0].range.end >= last_start:
                 print(
                     f"  Skipping {change_set.action} because it overlaps with the previous change set",
                     file=sys.stderr,
