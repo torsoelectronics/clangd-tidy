@@ -350,6 +350,7 @@ def collect_diagnostics(
                 args
             ),
         },
+        timeout=5,
     )
     lsp_client = LspClient(lsp_endpoint)
 
