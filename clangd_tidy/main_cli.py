@@ -4,6 +4,7 @@ import argparse
 from collections import defaultdict, namedtuple
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -165,6 +166,11 @@ def main_cli():
         help="Path to clangd executable. [default: clangd]",
     )
     parser.add_argument(
+        "--clangd-args",
+        default="",
+        help="Extra arguments to pass to clangd. [default: '']",
+    )
+    parser.add_argument(
         "--allow-extensions",
         default=DEFAULT_ALLOW_EXTENSIONS,
         help=f"A comma-separated list of file extensions to allow. [default: {','.join(DEFAULT_ALLOW_EXTENSIONS)}]",
@@ -228,6 +234,7 @@ def main_cli():
         files=files,
         compile_commands_dir=args.compile_commands_dir,
         clangd_executable=args.clangd_executable,
+        clangd_args=args.clangd_args,
         jobs=args.jobs,
         output=args.output,
         fail_on_severity=args.fail_on_severity,
@@ -246,6 +253,7 @@ def run(
     files,
     compile_commands_dir,
     clangd_executable,
+    clangd_args,
     jobs,
     output,
     fail_on_severity,
@@ -270,6 +278,7 @@ def run(
             files_to_process,
             compile_commands_dir,
             clangd_executable,
+            clangd_args,
             jobs,
             verbose,
             tqdm,
@@ -312,7 +321,7 @@ def run(
 
 
 def collect_diagnostics(
-    files, compile_commands_dir, clangd_executable, jobs, verbose, tqdm
+    files, compile_commands_dir, clangd_executable, clangd_args, jobs, verbose, tqdm
 ):
     clangd_command = [
         f"{clangd_executable}",
@@ -324,7 +333,7 @@ def collect_diagnostics(
         "--pch-storage=memory",
         "--enable-config",
         "--offset-encoding=utf-16",
-    ]
+    ] + shlex.split(clangd_args)
 
     p = subprocess.Popen(
         clangd_command,
